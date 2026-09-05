@@ -2,6 +2,7 @@ package cron
 
 import (
 	"context"
+	"runtime/debug"
 	"time"
 
 	gormlock "github.com/go-co-op/gocron-gorm-lock/v2"
@@ -64,14 +65,37 @@ func StartCronJobs(ctx context.Context, db *gorm.DB, cnf *config.ServerCmdConfig
 	}
 
 	cron := CronService{db: db, cnf: cnf, logger: logging.DefaultLogger().Sugar()}
+
+	// Defence in depth for tgdrive/teldrive#580. Fixing the known nil-client
+	// dereference is necessary but not sufficient: gocron runs every job on
+	// its own goroutine, and an unrecovered panic there takes the entire
+	// process down -- HTTP handlers are covered by chi's Recoverer, cron jobs
+	// are covered by nothing. A background cleanup job failing must never be
+	// able to kill a media server. Any future panic is logged and the job is
+	// simply skipped until its next tick.
+	guard := func(name string, fn func(context.Context)) func(context.Context) {
+		return func(c context.Context) {
+			defer func() {
+				if r := recover(); r != nil {
+					cron.logger.Errorw("cron job panicked, server kept alive",
+						"job", name, "panic", r, "stack", string(debug.Stack()))
+				}
+			}()
+			fn(c)
+		}
+	}
+	guard0 := func(name string, fn func()) func() {
+		return func() { guard(name, func(context.Context) { fn() })(ctx) }
+	}
+
 	scheduler.NewJob(gocron.DurationJob(cnf.CronJobs.CleanFilesInterval),
-		gocron.NewTask(cron.cleanFiles, ctx))
+		gocron.NewTask(guard("clean_files", cron.cleanFiles), ctx))
 	scheduler.NewJob(gocron.DurationJob(cnf.CronJobs.FolderSizeInterval),
-		gocron.NewTask(cron.updateFolderSize))
+		gocron.NewTask(guard0("update_folder_size", cron.updateFolderSize)))
 	scheduler.NewJob(gocron.DurationJob(cnf.CronJobs.CleanUploadsInterval),
-		gocron.NewTask(cron.cleanUploads, ctx))
+		gocron.NewTask(guard("clean_uploads", cron.cleanUploads), ctx))
 	scheduler.NewJob(gocron.DurationJob(time.Hour*12),
-		gocron.NewTask(cron.cleanOldEvents))
+		gocron.NewTask(guard0("clean_old_events", cron.cleanOldEvents)))
 
 	scheduler.Start()
 	return nil
@@ -105,8 +129,10 @@ func (c *CronService) cleanFiles(ctx context.Context) {
 
 	for _, row := range results {
 
+		// Un LEFT JOIN peut rendre une ligne sans session : la sauter, PAS
+		// abandonner la boucle -- sinon plus rien n'est nettoye ensuite.
 		if row.Session == "" {
-			break
+			continue
 		}
 		ids := []int{}
 
@@ -120,12 +146,27 @@ func (c *CronService) cleanFiles(ctx context.Context) {
 
 		}
 
-		client, _ := tgc.AuthClient(ctx, &c.cnf.TG, row.Session, middlewares...)
-		err := tgc.DeleteMessages(ctx, client, row.ChannelId, ids)
+		// Upstream discarded this error. When AuthClient fails, client is
+		// nil, DeleteMessages calls RunWithAuth -> (*telegram.Client).Run on
+		// a nil receiver, and the resulting panic is NOT recovered: cron jobs
+		// run on their own goroutines, outside chi's Recoverer, so it takes
+		// the whole server down. Reported upstream as tgdrive/teldrive#580,
+		// still open. This job runs hourly whenever anything sits in
+		// pending_deletion, which the orphan self-heal path now produces.
+		// Skip the row instead of killing the process; another user's rows
+		// are unaffected by one bad session.
+		client, err := tgc.AuthClient(ctx, &c.cnf.TG, row.Session, middlewares...)
+		if err != nil || client == nil {
+			c.logger.Errorw("clean_files: cannot build telegram client, skipping row",
+				"user", row.UserId, "channel", row.ChannelId, "error", err)
+			continue
+		}
 
-		if err != nil {
+		if err := tgc.DeleteMessages(ctx, client, row.ChannelId, ids); err != nil {
+			// continue et non return : une ligne qui resiste ne doit pas faire
+			// abandonner tout le lot jusqu'au tick suivant.
 			c.logger.Errorw("failed to delete messages", err)
-			return
+			continue
 		}
 
 		items := pgtype.Array[string]{
@@ -167,12 +208,18 @@ func (c *CronService) cleanUploads(ctx context.Context) {
 	for _, result := range results {
 
 		if result.Session != "" && len(result.Parts) > 0 {
-			client, _ := tgc.AuthClient(ctx, &c.cnf.TG, result.Session, middlewares...)
+			// Same nil-client crash as in cleanFiles above (#580).
+			client, err := tgc.AuthClient(ctx, &c.cnf.TG, result.Session, middlewares...)
+			if err != nil || client == nil {
+				c.logger.Errorw("clean_uploads: cannot build telegram client, skipping row",
+					"user", result.UserId, "channel", result.ChannelId, "error", err)
+				continue
+			}
 
-			err := tgc.DeleteMessages(ctx, client, result.ChannelId, result.Parts)
-			if err != nil {
+			if err := tgc.DeleteMessages(ctx, client, result.ChannelId, result.Parts); err != nil {
+				// idem : ne pas sacrifier le reste du lot.
 				c.logger.Errorw("failed to delete messages", err)
-				return
+				continue
 			}
 		}
 		items := pgtype.Array[int]{
@@ -180,8 +227,9 @@ func (c *CronService) cleanUploads(ctx context.Context) {
 			Valid:    true,
 			Dims:     []pgtype.ArrayDimension{{Length: int32(len(result.Parts)), LowerBound: 1}},
 		}
+		// un seul Delete : le second executait la meme suppression une deuxieme fois.
 		c.db.Where("part_id = any(?)", items).Where("channel_id = ?", result.ChannelId).
-			Where("user_id = ?", result.UserId).Delete(&models.Upload{}).Delete(&models.Upload{})
+			Where("user_id = ?", result.UserId).Delete(&models.Upload{})
 
 	}
 }

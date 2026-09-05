@@ -42,6 +42,12 @@ ntp = false
 disable-stream-bots = false
 storage-file = ''
 proxy = ''
+# Pool of proxy URLs for per-bot proxy rotation (optional)
+# Each bot will be assigned a different proxy from this pool
+# proxy-pool = [
+#     "socks5://user:pass@server1:1080",
+#     "socks5://user:pass@server2:1080"
+# ]
 rate-limit = true
 reconnect-timeout = '5m'
 

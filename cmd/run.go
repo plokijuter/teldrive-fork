@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"regexp"
 	"time"
 
@@ -83,13 +84,27 @@ func runApplication(ctx context.Context, conf *config.ServerCmdConfig) {
 
 	defer lg.Sync()
 
+	// Initialize MTProto middleware logger if configured
+	if conf.TG.MtprotoLogFile != "" {
+		if err := tgc.InitMtprotoMiddlewareLogger(conf.TG.MtprotoLogFile); err != nil {
+			lg.Warnw("failed to initialize MTProto middleware logger", "err", err)
+		} else {
+			lg.Infow("MTProto middleware logging enabled", "file", conf.TG.MtprotoLogFile)
+		}
+	}
+
 	port, err := findAvailablePort(conf.Server.Port)
 	if err != nil {
 		lg.Fatalw("failed to find available port", "err", err)
 	}
 	if port != conf.Server.Port {
-		lg.Infof("Port %d is occupied, using port %d instead", conf.Server.Port, port)
-		conf.Server.Port = port
+		// Demarrer en silence sur un AUTRE port est pire qu'echouer : le montage
+		// rclone, le chien de garde et heal-stack sondent tous 8080 en dur. Le
+		// service parait vivant, personne ne le trouve, et la pile se croit saine.
+		// Vu en vrai le 2026-08-30 : un redemarrage trop rapide, l'ancienne
+		// instance tenait encore le port, la nouvelle est partie ailleurs.
+		lg.Fatalw("le port configure est occupe : refus de demarrer ailleurs",
+			"port_configure", conf.Server.Port, "port_libre_trouve", port)
 	}
 
 	cacher := cache.NewCache(ctx, &conf.Cache)
@@ -106,13 +121,36 @@ func runApplication(ctx context.Context, conf *config.ServerCmdConfig) {
 		lg.Fatalw("failed to migrate database", "err", err)
 	}
 
-	worker := tgc.NewBotWorker()
+	worker := tgc.NewBotWorker(conf.TG.ProxyEnabled)
 
 	logger := logging.DefaultLogger()
 
 	eventRecorder := events.NewRecorder(ctx, db, logger)
 
 	srv := setupServer(conf, db, cacher, logger, worker, eventRecorder)
+	// Cached clients deliberately outlive individual requests. Close them
+	// explicitly after the HTTP server drains during a graceful shutdown.
+	defer tgc.CloseLiveClients()
+	// The existing enable-pprof flag previously had no implementation.
+	// Use a separate loopback listener, never the public media API.
+	if conf.Server.EnablePprof {
+		listener, err := net.Listen("tcp", "127.0.0.1:6060")
+		if err != nil {
+			lg.Warnw("pprof listener unavailable", "err", err)
+		} else {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/debug/pprof/", pprof.Index)
+			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+			debugServer := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+			defer debugServer.Close()
+			go func() {
+				if err := debugServer.Serve(listener); err != nil && err != http.ErrServerClosed {
+					lg.Warnw("pprof server stopped", "err", err)
+				}
+			}()
+		}
+	}
 
 	if conf.CronJobs.Enable {
 		err = cron.StartCronJobs(ctx, db, conf)
@@ -176,6 +214,11 @@ func setupServer(cfg *config.ServerCmdConfig, db *gorm.DB, cache cache.Cacher, l
 		},
 	}))
 	mux.Use(appcontext.Middleware)
+	mux.Use(middleware.ScanDetector(&middleware.ScanDetectorConfig{
+		Enabled:             cfg.ScanDetector.Enabled,
+		ThrottleDelayMs:     cfg.ScanDetector.ThrottleDelayMs,
+		ScanThresholdPerSec: cfg.ScanDetector.ScanThresholdPerSec,
+	}))
 	mux.Mount("/api/", http.StripPrefix("/api", extendedSrv))
 	mux.Handle("/*", middleware.SPAHandler(ui.StaticFS))
 

@@ -189,13 +189,30 @@ func (afb *fileQueryBuilder) buildFileQuery(query *gorm.DB, filesQuery *api.File
 	orderField := utils.CamelToSnake(string(filesQuery.Sort.Value))
 	op := getOrderOperation(filesQuery)
 
-	return afb.buildSubqueryCTE(query, filesQuery, userId).Clauses(exclause.NewWith("ranked_scores", afb.db.Model(&models.File{}).Select(orderField, "count(*) OVER () as total",
+	// Hors deepSearch, buildSubqueryCTE rend `query` LUI-MEME : le receveur porte
+	// donc deja user_id, status et parent_id. Le .Where(query) final les recopiait
+	// dans une parenthese imbriquee, avec deux consequences :
+	//   - la sous-requete correlee sur ranked_scores etait evaluee DEUX fois,
+	//     chacune parcourant le CTE pour n'y trouver qu'un seul rang ;
+	//   - la selectivite estimee etait elevee au CARRE, donc PostgreSQL croyait
+	//     que presque rien ne sortirait et se rabattait d'autant plus volontiers
+	//     sur un parcours de files_pkey avec LIMIT.
+	// En deepSearch au contraire, buildSubqueryCTE rend un NOUVEAU *gorm.DB qui
+	// ne porte aucun filtre : le .Where(query) y est indispensable.
+	deep := filesQuery.DeepSearch.Value && filesQuery.Query.Value != "" && filesQuery.Path.Value != ""
+
+	stmt := afb.buildSubqueryCTE(query, filesQuery, userId).Clauses(exclause.NewWith("ranked_scores", afb.db.Model(&models.File{}).Select(orderField, "count(*) OVER () as total",
 		fmt.Sprintf("ROW_NUMBER() OVER (ORDER BY %s %s) AS rank", orderField, strings.ToUpper(string(filesQuery.Order.Value)))).
 		Where(query))).Model(&models.File{}).
 		Select(selectedFields, "(select total from ranked_scores limit 1) as total").
 		Where(fmt.Sprintf("%s %s (SELECT %s FROM ranked_scores WHERE rank = ?)", orderField, op, orderField),
-			max((filesQuery.Page.Value-1)*filesQuery.Limit.Value, 1)).
-		Where(query).Order(getOrder(filesQuery)).Limit(filesQuery.Limit.Value)
+			max((filesQuery.Page.Value-1)*filesQuery.Limit.Value, 1))
+
+	if deep {
+		stmt = stmt.Where(query)
+	}
+
+	return stmt.Order(getOrder(filesQuery)).Limit(filesQuery.Limit.Value)
 }
 
 func (afb *fileQueryBuilder) buildSubqueryCTE(query *gorm.DB, filesQuery *api.FilesListParams, userId int64) *gorm.DB {

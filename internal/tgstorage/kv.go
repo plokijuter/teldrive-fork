@@ -27,20 +27,27 @@ type kvStorage struct {
 }
 
 func (s kvStorage) Set(ctx context.Context, k, v string) error {
-	_, err := s.Get(ctx, k)
-	if err != nil {
-		return s.db.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Save(&KeyValue{
-				Key:       k,
-				Value:     []byte(v),
-				CreatedAt: time.Now().UTC(),
-			}).Error; err != nil {
-				return errors.Wrap(err, "save value")
-			}
-			return nil
-		})
+	// L'ancienne version faisait un Get d'abord et NE REECRIVAIT PAS si la cle
+	// existait deja : toute mise a jour de session gotd (rotation du sel serveur)
+	// etait perdue en silence. Ca "marchait" parce que gotd renegocie via
+	// bad_server_salt a la reconnexion -- au prix d'un aller-retour de plus a
+	// chaque connexion a froid. On ecrit toujours.
+	if err := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&KeyValue{
+			Key:       k,
+			Value:     []byte(v),
+			CreatedAt: time.Now().UTC(),
+		}).Error; err != nil {
+			return errors.Wrap(err, "save value")
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
-	return err
+	// Get met en cache 60 min : sans invalidation on continuerait a servir
+	// l'ancienne valeur qu'on vient justement de remplacer.
+	s.cache.Delete(cache.Key(k))
+	return nil
 }
 
 func (s kvStorage) Get(ctx context.Context, key string) (string, error) {

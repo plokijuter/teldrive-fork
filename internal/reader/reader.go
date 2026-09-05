@@ -2,6 +2,7 @@ package reader
 
 import (
 	"context"
+	"fmt"
 	"io"
 
 	"github.com/gotd/td/tg"
@@ -128,6 +129,25 @@ func (r *LinearReader) moveToNextPart() error {
 
 func (r *LinearReader) getPartReader() (io.ReadCloser, error) {
 	currentRange := r.ranges[r.pos]
+
+	// GARDE (2026-08-29). calculatePartByteRanges deduit les indices de part
+	// a partir de parts[0].Size en supposant toutes les parts de cette taille.
+	// Si l'enregistrement du fichier est incoherent -- taille declaree
+	// superieure a ce que ses parts couvrent reellement, ce qui arrive quand un
+	// envoi est interrompu et commite avec une liste incomplete -- l'indice
+	// calcule depasse la liste et le code paniquait :
+	//   panic: index out of range [7] with length 7
+	// a CHAQUE requete de lecture, rattrapee par chi mais repetee sans fin.
+	// Mesure : S01E01 Thunderbirds, 3 789 981 350 octets declares, 7 parts,
+	// lecture impossible au-dela de ~3,67 Go (unexpected EOF).
+	//
+	// Un enregistrement corrompu doit rendre une erreur exploitable, pas
+	// faire tomber le handler.
+	if currentRange.PartNo < 0 || int(currentRange.PartNo) >= len(r.parts) {
+		return nil, fmt.Errorf("file parts mismatch: part %d requested but file %s has only %d parts (truncated upload -- re-upload needed)",
+			currentRange.PartNo, r.file.ID, len(r.parts))
+	}
+
 	partId := r.parts[currentRange.PartNo].ID
 
 	chunkSrc := &chunkSource{
@@ -136,6 +156,7 @@ func (r *LinearReader) getPartReader() (io.ReadCloser, error) {
 		client:      r.client,
 		concurrency: r.concurrency,
 		cache:       r.cache,
+		useCache:    r.config.Stream.LocationCache,
 		key:         cache.Key("files", "location", r.file.ID, partId),
 	}
 
@@ -144,6 +165,14 @@ func (r *LinearReader) getPartReader() (io.ReadCloser, error) {
 		err    error
 	)
 	if *r.file.Encrypted {
+		// Meme garde qu'au-dessus : sur le chemin chiffre, l'indice vient du
+		// meme calcul et deborderait de la meme facon sur un enregistrement
+		// incoherent. Inatteignable tant que encrypted=false, mais le laisser
+		// nu serait une panique en embuscade.
+		if r.ranges[r.pos].PartNo < 0 || int(r.ranges[r.pos].PartNo) >= len(r.parts) {
+			return nil, fmt.Errorf("file parts mismatch (encrypted path): part %d requested but file %s has only %d parts",
+				r.ranges[r.pos].PartNo, r.file.ID, len(r.parts))
+		}
 		salt := r.parts[r.ranges[r.pos].PartNo].Salt
 		cipher, _ := crypt.NewCipher(r.config.Uploads.EncryptionKey, salt)
 		reader, err = cipher.DecryptDataSeek(r.ctx,

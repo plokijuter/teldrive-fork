@@ -24,13 +24,16 @@ import (
 	"github.com/tgdrive/teldrive/internal/database"
 	"github.com/tgdrive/teldrive/internal/events"
 	"github.com/tgdrive/teldrive/internal/http_range"
+	"github.com/tgdrive/teldrive/internal/logging"
 	"github.com/tgdrive/teldrive/internal/md5"
+	"github.com/tgdrive/teldrive/internal/pool"
 	"github.com/tgdrive/teldrive/internal/reader"
 	"github.com/tgdrive/teldrive/internal/tgc"
 	"github.com/tgdrive/teldrive/internal/utils"
 	"github.com/tgdrive/teldrive/pkg/mapper"
 	"github.com/tgdrive/teldrive/pkg/models"
 	"github.com/tgdrive/teldrive/pkg/types"
+	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -41,6 +44,32 @@ var (
 	ErrorStreamAbandoned = errors.New("stream abandoned")
 	defaultContentType   = "application/octet-stream"
 )
+
+// isProxyError checks if an error is likely related to proxy connectivity issues
+func isProxyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	// Check for common proxy-related error patterns
+	proxyErrors := []string{
+		"connection refused",
+		"timeout",
+		"dial tcp",
+		"dial socks",
+		"proxy",
+		"socks",
+		"i/o timeout",
+		"no route to host",
+		"network is unreachable",
+	}
+	for _, pattern := range proxyErrors {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
+	}
+	return false
+}
 
 type buffer struct {
 	Buf []byte
@@ -333,13 +362,29 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 	).Scan(&fileDB).Error; err != nil {
 		return nil, &apiError{err: err}
 	}
+	// POST also replaces an existing active file through the upsert above.
+	// Its ID stays the same, so both metadata and resolved message parts must
+	// expire after the write succeeds. Locations are keyed by part ID and do
+	// not need a broad eviction when replacement uploads use new messages.
+	a.cache.Delete(cache.Key("files", fileDB.ID), cache.Key("files", "messages", fileDB.ID))
 	a.events.Record(events.OpCreate, userId, &models.Source{
 		ID:       fileDB.ID,
 		Type:     fileDB.Type,
 		Name:     fileDB.Name,
-		ParentID: *fileDB.ParentId,
+		ParentID: parentIDOuVide(fileDB.ParentId),
 	})
 	return mapper.ToFileOut(fileDB), nil
+}
+
+// parentIDOuVide rend l'identifiant du parent, ou une chaine vide pour la racine.
+// parent_id EST nullable et vaut NULL pour exactement une ligne : le dossier
+// racine. Sans cette garde, toute operation visant la racine faisait paniquer le
+// serveur sur le deref d'un pointeur nil, dans quatre enregistrements d'evenement.
+func parentIDOuVide(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 func (a *apiService) FilesCreateShare(ctx context.Context, req *api.FileShareCreate, params api.FilesCreateShareParams) error {
@@ -386,11 +431,19 @@ func (a *apiService) FilesDelete(ctx context.Context, req *api.FileDelete) error
 		return &apiError{err: err}
 	}
 
+	// Le cache "files/<id>" est pose avec une expiration de 0, ce qui vaut
+	// PERMANENT chez freecache. Sans purge explicite, FilesStream continuerait a
+	// servir les metadonnees d'un fichier qui n'existe plus. FilesUpdate le fait
+	// deja ; ni Delete ni Move ne le faisaient.
+	for _, id := range req.Ids {
+		a.cache.Delete(cache.Key("files", id))
+	}
+
 	a.events.Record(events.OpDelete, userId, &models.Source{
 		ID:       fileDB.ID,
 		Type:     fileDB.Type,
 		Name:     fileDB.Name,
-		ParentID: *fileDB.ParentId,
+		ParentID: parentIDOuVide(fileDB.ParentId),
 	})
 
 	return nil
@@ -520,15 +573,23 @@ func (a *apiService) FilesMove(ctx context.Context, req *api.FileMove) error {
 			Valid:    true,
 			Dims:     []pgtype.ArrayDimension{{Length: int32(len(req.Ids)), LowerBound: 1}},
 		}
-		if err := a.db.Model(&models.File{}).Where("id = any(?)", items).Where("user_id = ?", userId).
+		// tx et non a.db : sinon l'UPDATE de masse s'execute HORS de la
+		// transaction et n'est pas annule si l'enregistrement d'evenement echoue.
+		if err := tx.Model(&models.File{}).Where("id = any(?)", items).Where("user_id = ?", userId).
 			Update("parent_id", req.DestinationParent).Error; err != nil {
 			return err
 		}
+		// meme raison que dans FilesDelete : apres un deplacement ou un renommage,
+		// le Content-Disposition servi par FilesStream resterait l'ancien.
+		for _, id := range req.Ids {
+			a.cache.Delete(cache.Key("files", id))
+		}
+
 		a.events.Record(events.OpMove, userId, &models.Source{
 			ID:           req.DestinationParent,
 			Type:         srcFile.Type,
 			Name:         srcFile.Name,
-			ParentID:     *srcFile.ParentId,
+			ParentID:     parentIDOuVide(srcFile.ParentId),
 			DestParentID: req.DestinationParent,
 		})
 		return nil
@@ -609,7 +670,7 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 		ID:       file.ID,
 		Type:     file.Type,
 		Name:     file.Name,
-		ParentID: *file.ParentId,
+		ParentID: parentIDOuVide(file.ParentId),
 	})
 	return mapper.ToFileOut(file), nil
 }
@@ -681,6 +742,22 @@ func (a *apiService) FilesUpdateParts(ctx context.Context, req *api.FilePartsUpd
 	return nil
 }
 
+// deleteOrphanFile marks a file whose Telegram messages are gone as
+// pending_deletion (using the file owner's user_id, not the requester's)
+// and drops every cache entry so it stops being served immediately.
+func (e *extendedService) deleteOrphanFile(file *models.File, fileId string, logger *zap.Logger) {
+	if err := e.api.db.Exec("call teldrive.delete_files_bulk($1, $2)", []string{fileId}, file.UserId).Error; err != nil {
+		logger.Error("failed to delete orphan file from database",
+			zap.String("fileId", fileId),
+			zap.Error(err))
+	}
+	keys := []string{cache.Key("files", fileId), cache.Key("files", "messages", fileId)}
+	for _, part := range file.Parts {
+		keys = append(keys, cache.Key("files", "location", fileId, part.ID))
+	}
+	e.api.cache.Delete(keys...)
+}
+
 func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fileId string, userId int64) {
 	ctx := r.Context()
 	var (
@@ -701,7 +778,7 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 			if err != nil {
 				http.Error(w, "invalid token", http.StatusUnauthorized)
 			}
-			userId, _ := strconv.ParseInt(user.Subject, 10, 64)
+			userId, _ = strconv.ParseInt(user.Subject, 10, 64)
 			session = &models.Session{UserId: userId, Session: user.TgSession}
 		} else {
 			session, err = auth.GetSessionByHash(e.api.db, e.api.cache, authHash)
@@ -709,6 +786,7 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 				http.Error(w, "invalid hash", http.StatusBadRequest)
 				return
 			}
+			userId = session.UserId
 		}
 	} else {
 		session = &models.Session{UserId: userId}
@@ -725,6 +803,21 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	// A part with message id 0 can never exist on Telegram: streaming it is
+	// guaranteed to fail with MESSAGE_IDS_EMPTY. Reject before any header is
+	// written so the client receives a real 410 instead of a truncated 206.
+	for _, part := range file.Parts {
+		if part.ID == 0 {
+			l := logging.FromContext(ctx)
+			l.Warn("file has invalid telegram message id 0, deleting from database",
+				zap.String("fileId", fileId),
+				zap.String("name", file.Name))
+			e.deleteOrphanFile(file, fileId, l)
+			http.Error(w, "File no longer exists on Telegram", http.StatusGone)
+			return
+		}
 	}
 
 	w.Header().Set("Accept-Ranges", "bytes")
@@ -796,11 +889,19 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		return
 	}
 
-	tokens, err := e.api.channelManager.BotTokens(session.UserId)
+	tokenProxies, err := e.api.channelManager.BotTokensWithProxies(session.UserId)
 
 	if err != nil {
 		http.Error(w, "failed to get bots", http.StatusInternalServerError)
 		return
+	}
+
+	// Extract tokens and build proxy map
+	tokens := make([]string, len(tokenProxies))
+	proxyMap := make(map[string]string)
+	for i, tp := range tokenProxies {
+		tokens[i] = tp.Token
+		proxyMap[tp.Token] = tp.ProxyUrl
 	}
 
 	var (
@@ -808,11 +909,16 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		client       *telegram.Client
 		multiThreads int
 		token        string
+		// clientIsLive : le client vient du cache de clients persistants,
+		// il est DEJA connecte et autorise -- il ne faut donc pas
+		// l'enrober dans RunWithAuth, qui le deconnecterait a la fin.
+		clientIsLive bool
 	)
 
+	logger := logging.FromContext(ctx)
 	multiThreads = e.api.cnf.TG.Stream.MultiThreads
 	middlewares := tgc.NewMiddleware(&e.api.cnf.TG, tgc.WithFloodWait(),
-		tgc.WithRecovery(ctx),
+		tgc.WithRecovery(),
 		tgc.WithRetry(5),
 		tgc.WithRateLimit())
 	if e.api.cnf.TG.DisableStreamBots || len(tokens) == 0 {
@@ -824,14 +930,102 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		multiThreads = 0
 
 	} else {
-		e.api.worker.Set(tokens, session.UserId)
+		e.api.worker.SetWithProxies(tokens, proxyMap, session.UserId)
 
-		token, _ = e.api.worker.Next(session.UserId)
+		// Filter out blocked bots
+		availableTokens := tgc.GetAvailableBots(tokens)
+		if len(availableTokens) == 0 {
+			logger.Warn("all bots are blocked, using user session as fallback", zap.String("fileId", fileId))
+			client, err = tgc.AuthClient(ctx, &e.api.cnf.TG, session.Session, middlewares...)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			multiThreads = 0
+		} else {
+			// Try bots until one works
+			var lastErr error
+			for i := 0; i < len(availableTokens); i++ {
+				token, _ = e.api.worker.Next(session.UserId)
+				botId := strings.Split(token, ":")[0]
 
-		client, err = tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, middlewares...)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+				// Skip if this specific bot is blocked
+				if tgc.IsBotBlocked(botId) {
+					logger.Debug("skipping blocked bot", zap.String("bot", botId), zap.String("fileId", fileId))
+					continue
+				}
+
+				proxyUrl := e.api.worker.GetProxy(token)
+				if proxyUrl != "" {
+					logger.Debug("using proxy for streaming", zap.String("bot", botId), zap.String("proxy", proxyUrl), zap.String("fileId", fileId))
+				}
+
+				// Add AuthRecovery middleware to handle AUTH_KEY_UNREGISTERED errors
+				sessionKey := cache.Key("sessions", e.api.cnf.TG.SessionInstance, botId)
+				streamMiddlewares := append(middlewares, tgc.NewAuthRecovery(e.api.db, e.api.cache, sessionKey))
+
+				// Cache de clients MTProto persistants ([tg.stream] client-cache).
+				// On evite ainsi une poignee de main complete par requete HTTP.
+				// En cas d'echec on retombe silencieusement sur le chemin
+				// historique : le cache ne doit jamais empecher une lecture.
+				if e.api.cnf.TG.Stream.ClientCache {
+					liveClient, liveErr := tgc.GetLiveClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, proxyUrl)
+					if liveErr == nil {
+						client = liveClient
+						clientIsLive = true
+						lastErr = nil
+						break
+					}
+					logger.Debug("client cache indisponible, repli sur un client par requete",
+						zap.String("bot", botId), zap.Error(liveErr))
+				}
+
+				client, err = tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, proxyUrl, streamMiddlewares...)
+				if err != nil {
+					// Check if it's a proxy error - retry without proxy first
+					if proxyUrl != "" && isProxyError(err) {
+						logger.Warn("proxy connection failed for streaming, retrying without proxy",
+							zap.String("bot", botId),
+							zap.String("proxy", proxyUrl),
+							zap.String("fileId", fileId),
+							zap.Error(err))
+						client, err = tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, "", streamMiddlewares...)
+					}
+
+					// If still error, check if AUTH_KEY_UNREGISTERED
+					if err != nil {
+						if tgc.IsAuthKeyUnregistered(err) {
+							logger.Warn("bot AUTH_KEY_UNREGISTERED, blocking and trying next bot",
+								zap.String("bot", botId),
+								zap.String("fileId", fileId),
+								zap.Error(err))
+							tgc.BlockBot(botId, 5*time.Minute)
+							lastErr = err
+							continue // Try next bot
+						}
+						lastErr = err
+						continue // Try next bot for other errors too
+					}
+				}
+
+				// Success - we have a working client
+				lastErr = nil
+				break
+			}
+
+			// If all bots failed, fallback to user session
+			if !clientIsLive && (client == nil || lastErr != nil) {
+				logger.Warn("all bots failed, falling back to user session",
+					zap.String("fileId", fileId),
+					zap.Error(lastErr))
+				client, err = tgc.AuthClient(ctx, &e.api.cnf.TG, session.Session, middlewares...)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				multiThreads = 0
+				token = "" // Clear token since we're using user session
+			}
 		}
 	}
 	if download {
@@ -839,32 +1033,153 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 	}
 
 	if r.Method != "HEAD" {
-		handleStream := func() error {
-			parts, err := getParts(ctx, client, e.api.cache, file)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return nil
-			}
-			lr, err = reader.NewLinearReader(ctx, client.API(), e.api.cache, file, parts, start, end, &e.api.cnf.TG, multiThreads)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return nil
-			}
-			if lr == nil {
-				http.Error(w, "failed to initialise reader", http.StatusInternalServerError)
-				return nil
-			}
+		// Create streaming function with retry support
+		streamWithRetry := func(streamClient *telegram.Client, streamToken string) error {
+			handleStream := func() error {
+				// Add bot ID to context for MTProto logging
+				streamCtx := ctx
+				if streamToken != "" {
+					botId := strings.Split(streamToken, ":")[0]
+					streamCtx = tgc.WithBotID(ctx, botId)
+				} else {
+					streamCtx = tgc.WithBotID(ctx, "user_session")
+				}
 
-			_, err = io.CopyN(w, lr, contentLength)
-			if err != nil {
-				lr.Close()
+				parts, err := getParts(streamCtx, streamClient, e.api.cache, file)
+				if err != nil {
+					return err
+				}
+				// Pool de connexions en LECTURE (drapeau [tg.stream] pool-size).
+				// L'envoi ouvre deja PoolSize connexions ; la lecture n'en
+				// ouvrait qu'une, partagee par les N goroutines de
+				// fillBatch -- or MTProto serialise sur une connexion.
+				// A 0, comportement inchange. Le pool est ferme ici meme :
+				// lr est entierement consomme par le io.CopyN ci-dessous,
+				// dans cette meme closure.
+				streamAPI := streamClient.API()
+				if e.api.cnf.TG.Stream.PoolSize > 0 {
+					readPool := pool.NewPool(streamClient, int64(e.api.cnf.TG.Stream.PoolSize), middlewares...)
+					defer readPool.Close()
+					streamAPI = readPool.Default(streamCtx)
+				}
+
+				lr, err = reader.NewLinearReader(streamCtx, streamAPI, e.api.cache, file, parts, start, end, &e.api.cnf.TG, multiThreads)
+				if err != nil {
+					return err
+				}
+				if lr == nil {
+					return errors.New("failed to initialise reader")
+				}
+
+				_, err = io.CopyN(w, lr, contentLength)
+				if err != nil {
+					lr.Close()
+					return err
+				}
+				return nil
 			}
-			return nil
+			// Un client issu du cache tourne deja dans sa propre goroutine :
+			// le passer a RunWithAuth ouvrirait une SECONDE connexion puis
+			// la fermerait en sortie, ce qui annulerait tout le benefice.
+			if clientIsLive {
+				return handleStream()
+			}
+			return tgc.RunWithAuth(ctx, streamClient, streamToken, func(ctx context.Context) error {
+				return handleStream()
+			})
 		}
-		tgc.RunWithAuth(ctx, client, token, func(ctx context.Context) error {
-			return handleStream()
-		})
 
+		// Try streaming with current client
+		streamErr := streamWithRetry(client, token)
+
+		// If MESSAGE_IDS_EMPTY, the file no longer exists on Telegram - delete from DB and return 410 Gone
+		if streamErr != nil && tgc.IsMessageIdsEmpty(streamErr) {
+			logger.Warn("file no longer exists on Telegram (MESSAGE_IDS_EMPTY), deleting from database",
+				zap.String("fileId", fileId),
+				zap.Error(streamErr))
+			e.deleteOrphanFile(file, fileId, logger)
+			http.Error(w, "File no longer exists on Telegram", http.StatusGone)
+			return
+		}
+
+		// If getParts found fewer real Telegram messages than the DB expects,
+		// the file is orphaned the same way MESSAGE_IDS_EMPTY files are - clean
+		// it up instead of leaving the client to loop on a stream that starts
+		// (headers already sent above) but never delivers any data.
+		if streamErr != nil && tgc.IsFilePartsMismatch(streamErr) {
+			logger.Warn("file has parts mismatch (Telegram messages missing), deleting from database",
+				zap.String("fileId", fileId),
+				zap.Error(streamErr))
+			e.deleteOrphanFile(file, fileId, logger)
+			http.Error(w, "File no longer exists on Telegram", http.StatusGone)
+			return
+		}
+
+		// If AUTH_KEY_UNREGISTERED during streaming, retry with other bots
+		if streamErr != nil && tgc.IsAuthKeyUnregistered(streamErr) && token != "" {
+			botId := strings.Split(token, ":")[0]
+			logger.Warn("AUTH_KEY_UNREGISTERED during streaming, trying other bots",
+				zap.String("bot", botId),
+				zap.String("fileId", fileId),
+				zap.Error(streamErr))
+			tgc.BlockBot(botId, 5*time.Minute)
+
+			// Try remaining bots
+			availableTokens := tgc.GetAvailableBots(tokens)
+			for _, tryToken := range availableTokens {
+				tryBotId := strings.Split(tryToken, ":")[0]
+				if tgc.IsBotBlocked(tryBotId) {
+					continue
+				}
+
+				proxyUrl := proxyMap[tryToken]
+				sessionKey := cache.Key("sessions", e.api.cnf.TG.SessionInstance, tryBotId)
+				streamMiddlewares := append(middlewares, tgc.NewAuthRecovery(e.api.db, e.api.cache, sessionKey))
+
+				retryClient, err := tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, tryToken, proxyUrl, streamMiddlewares...)
+				if err != nil {
+					if tgc.IsAuthKeyUnregistered(err) {
+						tgc.BlockBot(tryBotId, 5*time.Minute)
+						continue
+					}
+					continue
+				}
+
+				logger.Info("retrying stream with different bot",
+					zap.String("bot", tryBotId),
+					zap.String("fileId", fileId))
+
+				streamErr = streamWithRetry(retryClient, tryToken)
+				if streamErr == nil {
+					break // Success!
+				}
+				if tgc.IsAuthKeyUnregistered(streamErr) {
+					tgc.BlockBot(tryBotId, 5*time.Minute)
+					continue
+				}
+				break // Non-auth error, stop retrying
+			}
+
+			// Last resort: try user session
+			if streamErr != nil && tgc.IsAuthKeyUnregistered(streamErr) {
+				logger.Warn("all bots failed during streaming, trying user session",
+					zap.String("fileId", fileId))
+				userClient, err := tgc.AuthClient(ctx, &e.api.cnf.TG, session.Session, middlewares...)
+				if err == nil {
+					streamErr = streamWithRetry(userClient, "")
+				}
+			}
+		}
+
+		if streamErr != nil && streamErr != ErrorStreamAbandoned {
+			// Don't log client disconnect errors
+			if !strings.Contains(streamErr.Error(), "context canceled") &&
+				!strings.Contains(streamErr.Error(), "broken pipe") {
+				logger.Error("streaming failed",
+					zap.String("fileId", fileId),
+					zap.Error(streamErr))
+			}
+		}
 	}
 }
 

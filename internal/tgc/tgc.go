@@ -79,8 +79,11 @@ func newClient(ctx context.Context, config *config.TGConfig, handler telegram.Up
 }
 
 func NoAuthClient(ctx context.Context, config *config.TGConfig, handler telegram.UpdateHandler, storage session.Storage) (*telegram.Client, error) {
+	// Borne : sans WithMaxRetries/WithMaxWait, SimpleWaiter attend
+	// INDEFINIMENT et EN SILENCE sur un FLOOD_WAIT (maxRetries et maxWait
+	// valent 0, donc les deux gardes sont desarmees).
 	middlewares := []telegram.Middleware{
-		floodwait.NewSimpleWaiter(),
+		floodwait.NewSimpleWaiter().WithMaxRetries(3).WithMaxWait(90 * time.Second),
 	}
 	middlewares = append(middlewares, ratelimit.New(rate.Every(time.Millisecond*100), 5))
 	return newClient(ctx, config, handler, storage, middlewares...)
@@ -101,14 +104,38 @@ func AuthClient(ctx context.Context, config *config.TGConfig, sessionStr string,
 	if err := loader.Save(context.TODO(), data); err != nil {
 		return nil, err
 	}
+
+	// Add MTProto logging middleware if enabled
+	if GetMtprotoMiddlewareLogger() != nil {
+		middlewares = append([]telegram.Middleware{NewMtprotoLoggingMiddleware("user_session")}, middlewares...)
+	}
+
 	return newClient(ctx, config, nil, storage, middlewares...)
 }
 
-func BotClient(ctx context.Context, db *gorm.DB, c cache.Cacher, config *config.TGConfig, token string, middlewares ...telegram.Middleware) (*telegram.Client, error) {
+func BotClient(ctx context.Context, db *gorm.DB, c cache.Cacher, config *config.TGConfig, token string, proxyUrl string, middlewares ...telegram.Middleware) (*telegram.Client, error) {
 
-	storage := tgstorage.NewSessionStorage(db, c, cache.Key("sessions", config.SessionInstance, strings.Split(token, ":")[0]))
+	botID := strings.Split(token, ":")[0]
+	storage := tgstorage.NewSessionStorage(db, c, cache.Key("sessions", config.SessionInstance, botID))
 
-	return newClient(ctx, config, nil, storage, middlewares...)
+	// Use per-bot proxy if provided
+	clientConfig := config
+	if proxyUrl != "" {
+		// Create a copy of the config with the custom proxy
+		configCopy := *config
+		configCopy.Proxy = proxyUrl
+		clientConfig = &configCopy
+
+		logger := logging.FromContext(ctx)
+		logger.Debug("using proxy for bot", zap.String("bot", botID), zap.String("proxy", proxyUrl))
+	}
+
+	// Add MTProto logging middleware if enabled
+	if GetMtprotoMiddlewareLogger() != nil {
+		middlewares = append([]telegram.Middleware{NewMtprotoLoggingMiddleware(botID)}, middlewares...)
+	}
+
+	return newClient(ctx, clientConfig, nil, storage, middlewares...)
 
 }
 
@@ -132,14 +159,20 @@ func NewMiddleware(config *config.TGConfig, opts ...middlewareOption) []telegram
 
 func WithFloodWait() middlewareOption {
 	return func(mc *middlewareConfig) {
-		mc.middlewares = append(mc.middlewares, floodwait.NewSimpleWaiter())
+		// Borne (voir NoAuthClient) : un waiter illimite avale l'erreur
+		// FLOOD_WAIT, ce qui rend INATTEIGNABLE la rotation de bots de
+		// pkg/services/upload.go:229,259 et fige le handler jusqu'au
+		// read-timeout du serveur. Au-dela de 90 s on rend la main :
+		// rclone re-POSTe la part et le bot suivant est essaye.
+		mc.middlewares = append(mc.middlewares,
+			floodwait.NewSimpleWaiter().WithMaxRetries(3).WithMaxWait(90*time.Second))
 	}
 }
 
-func WithRecovery(ctx context.Context) middlewareOption {
+func WithRecovery() middlewareOption {
 	return func(mc *middlewareConfig) {
 		mc.middlewares = append(mc.middlewares,
-			recovery.New(ctx, newBackoff(mc.config.ReconnectTimeout)))
+			recovery.New(func() backoff.BackOff { return newBackoff(mc.config.ReconnectTimeout) }))
 	}
 }
 
@@ -155,6 +188,15 @@ func WithRateLimit() middlewareOption {
 			mc.middlewares = append(mc.middlewares,
 				ratelimit.New(rate.Every(time.Millisecond*time.Duration(mc.config.Rate)), mc.config.RateBurst))
 		}
+	}
+}
+
+// WithAuthRecovery adds the AUTH_KEY_UNREGISTERED recovery middleware.
+// This middleware detects invalid sessions and removes them from the database
+// to prevent retry storms when authentication fails.
+func WithAuthRecovery(db *gorm.DB, cache cache.Cacher, sessionKey string) middlewareOption {
+	return func(mc *middlewareConfig) {
+		mc.middlewares = append(mc.middlewares, NewAuthRecovery(db, cache, sessionKey))
 	}
 }
 

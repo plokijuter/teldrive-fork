@@ -15,9 +15,11 @@ import (
 	"github.com/tgdrive/teldrive/internal/api"
 	"github.com/tgdrive/teldrive/internal/auth"
 	"github.com/tgdrive/teldrive/internal/cache"
+	"github.com/tgdrive/teldrive/internal/logging"
 	"github.com/tgdrive/teldrive/internal/tgc"
 	"github.com/tgdrive/teldrive/internal/tgstorage"
 	"github.com/tgdrive/teldrive/pkg/models"
+	"go.uber.org/zap"
 
 	"github.com/gotd/contrib/storage"
 	"gorm.io/gorm/clause"
@@ -25,12 +27,20 @@ import (
 
 func (a *apiService) UsersAddBots(ctx context.Context, req *api.AddBots) error {
 	userID := auth.GetUser(ctx)
+	logger := logging.FromContext(ctx)
 
 	payload := []models.Bot{}
 	if len(req.Bots) > 0 {
-		for _, token := range req.Bots {
+		proxyPool := a.cnf.TG.ProxyPool
+		for i, token := range req.Bots {
 			botID, _ := strconv.ParseInt(strings.Split(token, ":")[0], 10, 64)
-			payload = append(payload, models.Bot{UserId: userID, Token: token, BotId: botID})
+			var proxyUrl *string
+			if a.cnf.TG.ProxyEnabled && len(proxyPool) > 0 {
+				p := proxyPool[i%len(proxyPool)]
+				proxyUrl = &p
+				logger.Info("assigning proxy to bot", zap.String("bot", strings.Split(token, ":")[0]), zap.String("proxy", p))
+			}
+			payload = append(payload, models.Bot{UserId: userID, Token: token, BotId: botID, ProxyUrl: proxyUrl})
 		}
 		if err := a.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&payload).Error; err != nil {
 			return err

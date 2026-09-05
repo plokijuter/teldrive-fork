@@ -8,6 +8,7 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
@@ -157,7 +158,20 @@ func GetChunk(ctx context.Context, client *tg.Client, location tg.InputFileLocat
 		Precise:  true,
 	}
 
+	// Log the request if MTProto logger is enabled
+	logger := GetMtprotoLogger()
+	if logger != nil {
+		logger.LogRequest(ctx, req)
+	}
+
+	startTime := time.Now()
 	r, err := client.UploadGetFile(ctx, req)
+	duration := time.Since(startTime)
+
+	// Log the response if MTProto logger is enabled
+	if logger != nil {
+		logger.LogResponse(ctx, r, err, duration)
+	}
 
 	if err != nil {
 		return nil, err
@@ -191,14 +205,24 @@ func GetMediaContent(ctx context.Context, client *tg.Client, location tg.InputFi
 
 func GetBotInfo(ctx context.Context, db *gorm.DB, cache cache.Cacher, config *config.TGConfig, token string) (*types.BotInfo, error) {
 	var user *tg.User
+	var selfErr error
 	middlewares := NewMiddleware(config, WithFloodWait(), WithRateLimit())
-	client, _ := BotClient(ctx, db, cache, config, token, middlewares...)
-	err := RunWithAuth(ctx, client, token, func(ctx context.Context) error {
-		user, _ = client.Self(ctx)
+	client, err := BotClient(ctx, db, cache, config, token, "", middlewares...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create bot client: %w", err)
+	}
+	err = RunWithAuth(ctx, client, token, func(ctx context.Context) error {
+		user, selfErr = client.Self(ctx)
+		if selfErr != nil {
+			return selfErr
+		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
+	}
+	if user == nil {
+		return nil, errors.New("failed to get bot user info: user is nil")
 	}
 	return &types.BotInfo{Id: user.ID, UserName: user.Username, Token: token}, nil
 }

@@ -35,3 +35,9 @@ docs/dist
 teldrive-ui.zip
 internal/api
 .aider*
+
+# Working backups
+*.bak-*
+
+# Local executable; release artifacts are distributed separately.
+/teldrive

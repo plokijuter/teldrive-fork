@@ -82,6 +82,11 @@ func (a *apiService) SharesUnlock(ctx context.Context, req *api.ShareUnlock, par
 		return &apiError{err: ErrShareNotFound, code: http.StatusNotFound}
 	}
 
+	// Un partage sans mot de passe a Password == nil : le deref faisait
+	// paniquer le serveur sur un simple POST /shares/{id}/unlock.
+	if result[0].Password == nil {
+		return &apiError{err: ErrInvalidPassword, code: http.StatusForbidden}
+	}
 	if err := bcrypt.CompareHashAndPassword([]byte(*result[0].Password), []byte(req.Password)); err != nil {
 		return &apiError{err: ErrInvalidPassword, code: http.StatusForbidden}
 	}

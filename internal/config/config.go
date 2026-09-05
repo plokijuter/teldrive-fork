@@ -16,13 +16,20 @@ import (
 )
 
 type ServerCmdConfig struct {
-	Server   ServerConfig  `config:"server"`
-	Log      LoggingConfig `config:"log"`
-	JWT      JWTConfig     `config:"jwt"`
-	DB       DBConfig      `config:"db"`
-	TG       TGConfig      `config:"tg"`
-	CronJobs CronJobConfig `config:"cronjobs"`
-	Cache    CacheConfig   `config:"cache"`
+	Server       ServerConfig       `config:"server"`
+	Log          LoggingConfig      `config:"log"`
+	JWT          JWTConfig          `config:"jwt"`
+	DB           DBConfig           `config:"db"`
+	TG           TGConfig           `config:"tg"`
+	CronJobs     CronJobConfig      `config:"cronjobs"`
+	Cache        CacheConfig        `config:"cache"`
+	ScanDetector ScanDetectorConfig `config:"scan-detector"`
+}
+
+type ScanDetectorConfig struct {
+	Enabled             bool `config:"enabled" description:"Enable Jellyfin scan detection and throttling" default:"true"`
+	ThrottleDelayMs     int  `config:"throttle-delay-ms" description:"Base throttle delay in milliseconds" default:"200"`
+	ScanThresholdPerSec int  `config:"scan-threshold-per-sec" description:"Request threshold per second to detect scan" default:"10"`
 }
 
 type ServerConfig struct {
@@ -75,6 +82,28 @@ type TGStream struct {
 	MultiThreads int           `config:"multi-threads" description:"Number of download threads"`
 	Buffers      int           `config:"buffers" description:"Number of stream buffers" default:"8"`
 	ChunkTimeout time.Duration `config:"chunk-timeout" description:"Chunk download timeout" default:"20s"`
+	// LocationCache active le cache des locations Telegram. Il etait
+	// inoperant jusqu'au 2026-08-22 (pointeur passe par valeur a msgpack),
+	// ce qui coutait 2 RPC supplementaires par morceau de 1 Mio. Ce
+	// drapeau permet de MESURER le gain en le desactivant, sans
+	// reconstruire ni redeployer. Le laisser a true en production.
+	// PoolSize ouvre N connexions MTProto pour la LECTURE, comme le fait
+	// deja l'envoi (upload.go : pool.NewPool(client, TG.PoolSize)).
+	// Telegram limite le debit par connexion : la lecture n'en ouvrant
+	// qu'une seule, c'est l'explication structurelle du facteur ~12
+	// mesure le 2026-08-22 entre lecture (3,3 Mio/s) et envoi (40 Mio/s).
+	// 0 = comportement historique (une seule connexion partagee).
+	PoolSize int `config:"pool-size" description:"Connexions MTProto pour la lecture (0 = une seule, historique)" default:"0"`
+
+	// ClientCache garde des clients MTProto VIVANTS entre les requetes HTTP.
+	// Sans lui, teldrive construit un client neuf et appelle client.Run() a
+	// CHAQUE requete -- donc une poignee de main MTProto complete a chaque
+	// fois. Mesure du 2026-08-24 : ~1,3 s par aller-retour a froid, et
+	// ffmpeg en enchaine 3-4 pour demarrer une lecture, d'ou 4-6 s par saut.
+	// A false : comportement d'origine, strictement inchange.
+	ClientCache bool `config:"client-cache" description:"Garder les clients MTProto vivants entre les requetes (0 = comportement historique)" default:"false"`
+
+	LocationCache bool `config:"location-cache" description:"Cache Telegram file locations (false = ancien comportement, pour mesure A/B)" default:"true"`
 }
 
 type TGUpload struct {
@@ -82,14 +111,25 @@ type TGUpload struct {
 	Threads       int           `config:"threads" description:"Number of upload threads" default:"8"`
 	MaxRetries    int           `config:"max-retries" description:"Maximum upload retry attempts" default:"10"`
 	Retention     time.Duration `config:"retention" description:"Upload retention period" default:"7d"`
+	ChunkDelay    time.Duration `config:"chunk-delay" description:"Delay between chunk uploads to avoid flood" default:"0s"`
 }
 type TGConfig struct {
-	RateLimit         bool          `config:"rate-limit" description:"Enable rate limiting for API calls" default:"true"`
-	RateBurst         int           `config:"rate-burst" description:"Maximum burst size for rate limiting" default:"5"`
-	Rate              int           `config:"rate" description:"Rate limit in requests per minute" default:"100"`
+	RateLimit bool `config:"rate-limit" description:"Enable rate limiting for API calls" default:"true"`
+	RateBurst int  `config:"rate-burst" description:"Maximum burst size for rate limiting" default:"5"`
+	// ATTENTION : ce nombre n'est PAS une frequence, c'est un INTERVALLE
+	// EN MILLISECONDES. tgc.go fait rate.Every(time.Millisecond * Rate),
+	// donc 100 => une requete toutes les 100 ms => 10 RPC/s, et non
+	// 100 par minute comme la description le laissait croire.
+	// Plus la valeur est PETITE, plus on autorise de requetes.
+	// Mesure du 2026-08-22 : ce plafond de 10 RPC/s, combine au cout de
+	// 3 RPC par Mio, donnait exactement les 3,3 Mio/s constates en lecture.
+	Rate              int           `config:"rate" description:"Intervalle minimal entre requetes, en MILLISECONDES (100 = 10 req/s ; plus petit = plus rapide)" default:"100"`
 	Ntp               bool          `config:"ntp" description:"Use NTP for time synchronization"`
 	DisableStreamBots bool          `config:"disable-stream-bots" description:"Disable streaming bots"`
+	MtprotoLogFile    string        `config:"mtproto-log-file" description:"File path to log MTProto requests/responses (empty=disabled)"`
 	Proxy             string        `config:"proxy" description:"HTTP/SOCKS5 proxy URL"`
+	ProxyEnabled      bool          `config:"proxy-enabled" description:"Enable proxy usage" default:"false"`
+	ProxyPool         []string      `config:"proxy-pool" description:"Pool of proxy URLs for per-bot proxy rotation"`
 	ReconnectTimeout  time.Duration `config:"reconnect-timeout" description:"Client reconnection timeout" default:"5m"`
 	PoolSize          int           `config:"pool-size" description:"Session pool size" default:"8"`
 	EnableLogging     bool          `config:"enable-logging" description:"Enable Telegram client logging"`

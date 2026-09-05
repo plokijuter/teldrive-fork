@@ -12,8 +12,12 @@ func ToFileOut(file models.File) *api.File {
 		Name:      file.Name,
 		Type:      api.FileType(file.Type),
 		MimeType:  api.NewOptString(file.MimeType),
-		Encrypted: api.NewOptBool(*file.Encrypted),
 		UpdatedAt: api.NewOptDateTime(file.UpdatedAt),
+	}
+	// encrypted est nullable en base : une seule ligne NULL faisait tomber
+	// tous les listages du repertoire.
+	if file.Encrypted != nil {
+		res.Encrypted = api.NewOptBool(*file.Encrypted)
 	}
 	if file.ParentId != nil {
 		res.ParentId = api.NewOptString(*file.ParentId)

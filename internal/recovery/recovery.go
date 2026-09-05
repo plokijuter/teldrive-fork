@@ -12,23 +12,21 @@ import (
 )
 
 type recovery struct {
-	ctx     context.Context
-	backoff backoff.BackOff
+	newBackoff func() backoff.BackOff
 }
 
-func New(ctx context.Context, backoff backoff.BackOff) telegram.Middleware {
-	return &recovery{
-		ctx:     ctx,
-		backoff: backoff,
-	}
+func New(newBackoff func() backoff.BackOff) telegram.Middleware {
+	return &recovery{newBackoff: newBackoff}
 }
 
 func (r *recovery) Handle(next tg.Invoker) telegram.InvokeFunc {
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 
+		// Backoff state belongs to this RPC, not the shared Telegram client.
+		// Its waits must end when this request is canceled.
 		return backoff.RetryNotify(func() error {
 			if err := next.Invoke(ctx, input, output); err != nil {
-				if r.shouldRecover(err) {
+				if shouldRecover(ctx, err) {
 					return errors.Wrap(err, "recover")
 				}
 
@@ -36,13 +34,13 @@ func (r *recovery) Handle(next tg.Invoker) telegram.InvokeFunc {
 			}
 
 			return nil
-		}, r.backoff, nil)
+		}, backoff.WithContext(r.newBackoff(), ctx), nil)
 	}
 }
 
-func (r *recovery) shouldRecover(err error) bool {
+func shouldRecover(ctx context.Context, err error) bool {
 	select {
-	case <-r.ctx.Done():
+	case <-ctx.Done():
 		return false
 	default:
 	}

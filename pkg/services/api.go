@@ -83,6 +83,11 @@ func (a *apiService) NewError(ctx context.Context, err error) *api.ErrorStatusCo
 			message = apiError.Error()
 		}
 		logging.FromContext(ctx).Error("api error", zap.Error(apiError))
+	default:
+		// Sans cette branche, toute erreur ne correspondant a aucun cas
+		// ci-dessus ressortait en 500 "Internal Server Error" SANS la moindre
+		// ligne de journal -- des pannes strictement invisibles.
+		logging.FromContext(ctx).Error("erreur non classee", zap.Error(err))
 	}
 	return &api.ErrorStatusCode{StatusCode: code, Response: api.Error{Code: code, Message: message}}
 }

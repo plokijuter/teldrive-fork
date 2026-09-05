@@ -1,17 +1,19 @@
 package reader
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gotd/td/tg"
 	"github.com/tgdrive/teldrive/internal/cache"
 	"github.com/tgdrive/teldrive/internal/config"
 	"github.com/tgdrive/teldrive/internal/tgc"
-	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -31,35 +33,114 @@ type chunkSource struct {
 	client      *tg.Client
 	key         string
 	cache       cache.Cacher
+	// useCache reflete [tg.stream] location-cache. Permet de rejouer
+	// l'ancien comportement pour mesurer le gain sans reconstruire.
+	useCache       bool
+	locationOnce   sync.Once
+	locationGate   chan struct{}
+	lastLocation   *tg.InputDocumentFileLocation // guarded by locationGate; obtained by this source’s client
+	lastLocationAt time.Time                     // monotonic completion time, also guarded by locationGate
 }
+
+// ttlLocation : duree de vie du cache de localisation Telegram.
+// Chaque miss coute DEUX appels reseau (channels.getChannels puis
+// channels.getMessages). 30 min etait tres prudent : le seul risque est
+// qu'une file_reference expire, cas deja rattrape juste en dessous par un
+// unique reessai avec une location fraiche. On peut donc voir large.
+const ttlLocation = 6 * time.Hour
 
 func (c *chunkSource) ChunkSize(start, end int64) int64 {
 	return tgc.CalculateChunkSize(start, end)
 }
 
-func (c *chunkSource) Chunk(ctx context.Context, offset int64, limit int64) ([]byte, error) {
-	var (
-		location *tg.InputDocumentFileLocation
-		err      error
-	)
+// estReferencePerimee reconnait FILE_REFERENCE_EXPIRED et ses variantes.
+// Telegram invalide periodiquement les file_reference ; une location mise
+// en cache peut donc devenir caduque avant la fin de son TTL.
+func estReferencePerimee(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToUpper(err.Error()), "FILE_REFERENCE")
+}
 
-	err = c.cache.Get(c.key, location)
-
+// location serializes metadata misses within this reader's part. Waiting is
+// cancellable, and each fetch retains its own caller's context: cancellation of
+// the first request cannot poison other chunks waiting for the same location.
+func (c *chunkSource) location(ctx context.Context, stale *tg.InputDocumentFileLocation, chunkStarted time.Time) (*tg.InputDocumentFileLocation, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if !c.useCache {
+		loc, err := tgc.GetLocation(ctx, c.client, c.channelId, c.partId)
+		return loc, false, err
+	}
+	cached := func() *tg.InputDocumentFileLocation {
+		var loc *tg.InputDocumentFileLocation
+		if c.cache.Get(c.key, &loc) != nil || loc == nil {
+			return nil
+		}
+		return loc
+	}
+	if stale == nil {
+		if loc := cached(); loc != nil {
+			return loc, true, nil
+		}
+	}
+	c.locationOnce.Do(func() { c.locationGate = make(chan struct{}, 1) })
+	select {
+	case c.locationGate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+	defer func() { <-c.locationGate }()
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if stale == nil {
+		if loc := cached(); loc != nil {
+			return loc, true, nil
+		}
+	} else {
+		// Other readers can populate the shared cache using another bot. Only
+		// reuse a reference obtained by this source's own client during this
+		// chunk request. An older local reference may itself have expired.
+		loc := c.lastLocation
+		if loc != nil && c.lastLocationAt.After(chunkStarted) && (loc.ID != stale.ID || loc.AccessHash != stale.AccessHash || loc.ThumbSize != stale.ThumbSize || !bytes.Equal(loc.FileReference, stale.FileReference)) {
+			return loc, true, nil
+		}
+		c.cache.Delete(c.key)
+	}
+	loc, err := tgc.GetLocation(ctx, c.client, c.channelId, c.partId)
 	if err != nil {
-		location, err = tgc.GetLocation(ctx, c.client, c.channelId, c.partId)
+		return nil, false, err
+	}
+	c.lastLocation = loc
+	c.lastLocationAt = time.Now()
+	c.cache.Set(c.key, loc, ttlLocation)
+	return loc, false, nil
+}
+
+func (c *chunkSource) Chunk(ctx context.Context, offset int64, limit int64) ([]byte, error) {
+	started := time.Now()
+	location, depuisCache, err := c.location(ctx, nil, started)
+	if err != nil {
+		return nil, err
+	}
+	chunk, err := tgc.GetChunk(ctx, c.client, location, offset, limit)
+	// Retry an expired cached reference only once, preserving the requested range.
+	if err != nil && depuisCache && estReferencePerimee(err) {
+		location, _, err = c.location(ctx, location, started)
 		if err != nil {
 			return nil, err
 		}
-		c.cache.Set(c.key, location, 30*time.Minute)
+		return tgc.GetChunk(ctx, c.client, location, offset, limit)
 	}
-
-	return tgc.GetChunk(ctx, c.client, location, offset, limit)
-
+	return chunk, err
 }
 
 type tgMultiReader struct {
 	ctx         context.Context
-	cancel      context.CancelFunc
+	cancel      context.CancelCauseFunc
 	offset      int64
 	limit       int64
 	chunkSize   int64
@@ -69,7 +150,6 @@ type tgMultiReader struct {
 	leftCut     int64
 	rightCut    int64
 	totalParts  int
-	currentPart int
 	chunkSrc    ChunkSource
 	timeout     time.Duration
 }
@@ -82,9 +162,11 @@ func newTGMultiReader(
 	chunkSrc ChunkSource,
 ) (*tgMultiReader, error) {
 	chunkSize := chunkSrc.ChunkSize(start, end)
+	if chunkSize <= 0 || start < 0 || end < start || config.Stream.MultiThreads <= 0 || config.Stream.Buffers < 0 {
+		return nil, fmt.Errorf("invalid parallel reader range or configuration")
+	}
 	offset := start - (start % chunkSize)
-
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
 
 	r := &tgMultiReader{
 		ctx:         ctx,
@@ -106,7 +188,7 @@ func newTGMultiReader(
 }
 
 func (r *tgMultiReader) Close() error {
-	r.cancel()
+	r.cancel(context.Canceled)
 	return nil
 }
 
@@ -119,11 +201,14 @@ func (r *tgMultiReader) Read(p []byte) (int, error) {
 		select {
 		case cur, ok := <-r.bufferChan:
 			if !ok {
+				if err := context.Cause(r.ctx); err != nil {
+					return 0, err
+				}
 				return 0, ErrStreamAbandoned
 			}
 			r.cur = cur
 		case <-r.ctx.Done():
-			return 0, r.ctx.Err()
+			return 0, context.Cause(r.ctx)
 		}
 	}
 
@@ -138,88 +223,88 @@ func (r *tgMultiReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// Keep an ordered window of at most concurrency requests. Once the next
+// chunk is delivered, refill its slot without waiting for the rest of a batch.
+// A stalled consumer bounds memory to the window plus bufferChan and cur.
 func (r *tgMultiReader) fillBuffer() {
 	defer close(r.bufferChan)
-
-	for r.currentPart < r.totalParts {
-		if err := r.fillBatch(); err != nil {
-			r.cancel()
+	type result struct {
+		chunk []byte
+		err   error
+	}
+	window := min(r.concurrency, r.totalParts)
+	slots := make([]chan result, window)
+	launch := func(part int) chan result {
+		ch := make(chan result, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
+			defer cancel()
+			chunk, err := r.fetchChunkWithTimeout(ctx, r.offset+int64(part)*r.chunkSize)
+			if errors.Is(err, context.DeadlineExceeded) {
+				err = ErrChunkTimeout
+			}
+			if err == nil {
+				left, right := int64(0), r.chunkSize
+				if part == 0 {
+					left = r.leftCut
+				}
+				if part == r.totalParts-1 {
+					right = r.rightCut
+				}
+				if int64(len(chunk)) < right {
+					err = io.ErrUnexpectedEOF
+				} else {
+					chunk = chunk[left:right]
+				}
+			}
+			if err != nil {
+				err = fmt.Errorf("chunk %d: %w", part, err)
+			}
+			ch <- result{chunk, err}
+		}()
+		return ch
+	}
+	for i := range window {
+		slots[i] = launch(i)
+	}
+	for part := 0; part < r.totalParts; part++ {
+		slot := part % window
+		var res result
+		select {
+		case res = <-slots[slot]:
+		case <-r.ctx.Done():
 			return
 		}
-	}
-}
-
-func (r *tgMultiReader) fillBatch() error {
-	g, ctx := errgroup.WithContext(r.ctx)
-	g.SetLimit(r.concurrency)
-
-	buffers := make([]*buffer, r.concurrency)
-
-	for i := 0; i < r.concurrency && r.currentPart+i < r.totalParts; i++ {
-		g.Go(func() error {
-			chunkCtx, cancel := context.WithTimeout(ctx, r.timeout)
-			defer cancel()
-
-			chunk, err := r.fetchChunkWithTimeout(chunkCtx, int64(i))
-			if err != nil {
-				if errors.Is(err, context.DeadlineExceeded) {
-					return fmt.Errorf("chunk %d: %w", r.currentPart+i, ErrChunkTimeout)
-				}
-				return fmt.Errorf("chunk %d: %w", r.currentPart+i, err)
-			}
-
-			if r.totalParts == 1 {
-				chunk = chunk[r.leftCut:r.rightCut]
-			} else if r.currentPart+i == 0 {
-				chunk = chunk[r.leftCut:]
-			} else if r.currentPart+i+1 == r.totalParts {
-				chunk = chunk[:r.rightCut]
-			}
-
-			buffers[i] = &buffer{buf: chunk}
-			return nil
-		})
-	}
-
-	if err := g.Wait(); err != nil {
-		return err
-	}
-
-	for _, buf := range buffers {
-		if buf == nil {
-			break
+		if res.err != nil {
+			r.cancel(res.err)
+			return
 		}
 		select {
-		case r.bufferChan <- buf:
+		case r.bufferChan <- &buffer{buf: res.chunk}:
 		case <-r.ctx.Done():
-			return r.ctx.Err()
+			return
+		}
+		if next := part + window; next < r.totalParts {
+			slots[slot] = launch(next)
 		}
 	}
-
-	r.currentPart += r.concurrency
-	r.offset += r.chunkSize * int64(r.concurrency)
-
-	return nil
 }
 
-func (r *tgMultiReader) fetchChunkWithTimeout(ctx context.Context, i int64) ([]byte, error) {
-	chunkChan := make(chan []byte, 1)
-	errChan := make(chan error, 1)
-
+func (r *tgMultiReader) fetchChunkWithTimeout(ctx context.Context, offset int64) ([]byte, error) {
+	type result struct {
+		chunk []byte
+		err   error
+	}
+	ch := make(chan result, 1)
+	// Capture the immutable offset before starting the request: a source that
+	// returns late after cancellation cannot observe another chunk's offset.
 	go func() {
-		chunk, err := r.chunkSrc.Chunk(ctx, r.offset+i*r.chunkSize, r.chunkSize)
-		if err != nil {
-			errChan <- err
-		} else {
-			chunkChan <- chunk
-		}
+		chunk, err := r.chunkSrc.Chunk(ctx, offset, r.chunkSize)
+		ch <- result{chunk, err}
 	}()
-
 	select {
-	case chunk := <-chunkChan:
-		return chunk, nil
-	case err := <-errChan:
-		return nil, err
+	case res := <-ch:
+		return res.chunk, res.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
