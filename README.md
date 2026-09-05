@@ -1,3 +1,14 @@
+# Unofficial fork: streaming and upload fixes (v24)
+
+This branch contains experimental changes to the original project.
+**[Read the differences, defaults, tests and compatibility limits](FORK_NOTES.md).**
+The custom build label is not an official upstream release number. The comparison
+is against the documented historical base, not current upstream main.
+
+The original project documentation follows below.
+
+---
+
 # Teldrive
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/tgdrive/teldrive)
 

@@ -1,0 +1,183 @@
+{
+  "method": {
+    "payload_mib": 128,
+    "order": [
+      "A",
+      "B",
+      "B",
+      "A",
+      "A",
+      "B"
+    ],
+    "repeats_per_variant": 3,
+    "A": "public rclone base 4e101c1c77eb5e4145435c60bd80a8b049db5e08",
+    "B": "custom rclone v36 source 9c7a904fdbb7771a3c1219b8475fe4b1028c254d",
+    "server": "custom Teldrive v24 for both variants",
+    "upload_per_file_limit_mib_s": 8,
+    "global_limit_note": "Global limit changed from 8Mi to off during uploads; the repeated upload series adds a separate per-file 8Mi limit. First-series uploads excluded.",
+    "upload_transfers": 1,
+    "upload_streams": 2,
+    "chunk_size_mib": 100,
+    "download": "direct cat with threaded_streams=true; same object, memory sink; one warm-up per variant",
+    "compiler": "Go 1.24.4; windows/amd64; CGO disabled for both benchmark binaries; no mount comparison"
+  },
+  "summary": {
+    "upload": {
+      "A": {
+        "median_mib_s": 5.157448023802834,
+        "min_mib_s": 5.118544818182231,
+        "max_mib_s": 5.16173675036964
+      },
+      "B": {
+        "median_mib_s": 5.154239530734415,
+        "min_mib_s": 5.138109678609975,
+        "max_mib_s": 5.162944275943034
+      },
+      "median_change_percent": -0.06221086579275559
+    },
+    "download": {
+      "A": {
+        "median_mib_s": 18.02786254041918,
+        "min_mib_s": 17.73928131991245,
+        "max_mib_s": 18.11207665303833
+      },
+      "B": {
+        "median_mib_s": 15.598155444990505,
+        "min_mib_s": 15.3756455804076,
+        "max_mib_s": 15.982770573332742
+      },
+      "median_change_percent": -13.477510658743785
+    }
+  },
+  "samples": [
+    {
+      "label": "upload-1-A",
+      "mode": "A",
+      "seconds": 25.007107400000677,
+      "bytes": 134217728,
+      "mib_s": 5.118544818182231,
+      "bwlimit_rates": [
+        "off"
+      ]
+    },
+    {
+      "label": "upload-4-A",
+      "mode": "A",
+      "seconds": 24.818476000000373,
+      "bytes": 134217728,
+      "mib_s": 5.157448023802834,
+      "bwlimit_rates": [
+        "8Mi",
+        "off"
+      ]
+    },
+    {
+      "label": "upload-5-A",
+      "mode": "A",
+      "seconds": 24.797855099997832,
+      "bytes": 134217728,
+      "mib_s": 5.16173675036964,
+      "bwlimit_rates": [
+        "8Mi",
+        "off"
+      ]
+    },
+    {
+      "label": "upload-2-B",
+      "mode": "B",
+      "seconds": 24.911885500005155,
+      "bytes": 134217728,
+      "mib_s": 5.138109678609975,
+      "bwlimit_rates": [
+        "8Mi",
+        "off"
+      ]
+    },
+    {
+      "label": "upload-3-B",
+      "mode": "B",
+      "seconds": 24.792055300000357,
+      "bytes": 134217728,
+      "mib_s": 5.162944275943034,
+      "bwlimit_rates": [
+        "8Mi",
+        "off"
+      ]
+    },
+    {
+      "label": "upload-6-B",
+      "mode": "B",
+      "seconds": 24.833925400002045,
+      "bytes": 134217728,
+      "mib_s": 5.154239530734415,
+      "bwlimit_rates": [
+        "8Mi",
+        "off"
+      ]
+    },
+    {
+      "label": "download-1-A",
+      "mode": "A",
+      "seconds": 7.215624899996328,
+      "bytes": 134217728,
+      "mib_s": 17.73928131991245,
+      "bwlimit_rates": [
+        "off"
+      ]
+    },
+    {
+      "label": "download-4-A",
+      "mode": "A",
+      "seconds": 7.1001207000008435,
+      "bytes": 134217728,
+      "mib_s": 18.02786254041918,
+      "bwlimit_rates": [
+        "off"
+      ]
+    },
+    {
+      "label": "download-5-A",
+      "mode": "A",
+      "seconds": 7.06710789999488,
+      "bytes": 134217728,
+      "mib_s": 18.11207665303833,
+      "bwlimit_rates": [
+        "off"
+      ]
+    },
+    {
+      "label": "download-2-B",
+      "mode": "B",
+      "seconds": 8.206098500006192,
+      "bytes": 134217728,
+      "mib_s": 15.598155444990505,
+      "bwlimit_rates": [
+        "off"
+      ]
+    },
+    {
+      "label": "download-3-B",
+      "mode": "B",
+      "seconds": 8.008623999994597,
+      "bytes": 134217728,
+      "mib_s": 15.982770573332742,
+      "bwlimit_rates": [
+        "off"
+      ]
+    },
+    {
+      "label": "download-6-B",
+      "mode": "B",
+      "seconds": 8.324853700003587,
+      "bytes": 134217728,
+      "mib_s": 15.3756455804076,
+      "bwlimit_rates": [
+        "off"
+      ]
+    }
+  ],
+  "integrity": {
+    "full_sha256_readbacks": 20,
+    "all_passed": true
+  }
+}
